@@ -1,0 +1,235 @@
+import express from 'express';
+import crypto from 'crypto';
+import { Pool } from 'pg';
+import fetch from 'node-fetch';
+import serverless from 'serverless-http';
+
+/** ====== ENV ====== */
+const {
+  DATABASE_URL,                 // Supabase Postgres
+  SHOP_DOMAIN,                  // ex: la-guinguettedescopains.fr
+  SHOP_ADMIN_TOKEN,             // Admin API access token Shopify
+  APP_PROXY_SECRET,             // App Proxy shared secret
+  WEBHOOK_SHARED_SECRET,        // Secret webhook orders/paid
+  COMMISSION_RATE_DEFAULT = '10',
+  ADMIN_IDS = '',               // CSV IDs clients admin Shopify (optionnel)
+  ADMIN_SECRET                  // secret endpoints admin
+} = process.env;
+
+/** ====== DB ====== */
+const pool = new Pool({ connectionString: DATABASE_URL });
+
+/** ====== Helpers ====== */
+function isAdminCustomer(cid){
+  if(!cid) return false;
+  return String(ADMIN_IDS).split(',').map(s=>s.trim()).filter(Boolean).includes(String(cid));
+}
+function hmacValidAppProxy(q){
+  const params={...q}; const signature=params.signature||params.sig||''; delete params.signature; delete params.sig;
+  const msg = Object.keys(params).sort().map(k=>`${k}=${params[k]}`).join('');
+  const mac = crypto.createHmac('sha256', APP_PROXY_SECRET).update(msg).digest('hex');
+  try{ return crypto.timingSafeEqual(Buffer.from(mac,'hex'), Buffer.from(signature,'hex')); }catch{ return false; }
+}
+async function tagCustomer(customerId, tag){
+  if(!SHOP_DOMAIN || !SHOP_ADMIN_TOKEN) return;
+  const url=`https://${SHOP_DOMAIN}/admin/api/2024-10/customers/${customerId}.json`;
+  try{
+    await fetch(url,{method:'PUT', headers:{'X-Shopify-Access-Token':SHOP_ADMIN_TOKEN,'Content-Type':'application/json'}, body:JSON.stringify({customer:{id:customerId, tags:tag}})});
+  }catch{}
+}
+
+/** ====== APP ====== */
+const app = express();
+
+/* --- Webhook orders-paid : RAW body pour HMAC --- */
+app.post('/api/index/webhooks/orders-paid', express.raw({ type:'application/json' }), async(req,res)=>{
+  try{
+    const h=req.headers['x-shopify-hmac-sha256']; if(!WEBHOOK_SHARED_SECRET||!h) return res.status(401).send('no hmac');
+    const digest = crypto.createHmac('sha256', WEBHOOK_SHARED_SECRET).update(req.body).digest('base64');
+    try{ if(!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(h))) return res.status(401).send('bad hmac'); }catch{ return res.status(401).send('bad hmac'); }
+
+    const order = JSON.parse(req.body.toString('utf8'));
+
+    // Trouver l'alias: 1) code LGC-ALIAS  2) cart attribute 'aff'
+    let alias='';
+    const codeApp = (order.discount_applications||[]).find(d=>d.type==='discount_code');
+    if(codeApp?.title && String(codeApp.title).toUpperCase().startsWith('LGC-')){
+      const m = String(codeApp.title).toUpperCase().match(/^LGC-([A-Z0-9\-_]+)$/); if(m) alias=m[1];
+    }
+    if(!alias){
+      const attrs = order.note_attributes||[]; const a=attrs.find(x=>(x.name||'').toLowerCase()==='aff');
+      if(a?.value) alias=String(a.value).toUpperCase();
+    }
+    if(!alias) return res.status(200).send('no_aff');
+
+    const subtotal = Number(order.current_subtotal_price_set?.shop_money?.amount || order.current_subtotal_price || 0);
+    const rate = Number(COMMISSION_RATE_DEFAULT||'10');
+    const comEur = +(subtotal*(rate/100)).toFixed(2);
+
+    const ordName = order.name || String(order.id);
+    const customer = order.customer ? `${order.customer.first_name||''} ${order.customer.last_name||''}`.trim() : '';
+
+    await pool.query(
+      `insert into aff_orders(order_id, order_name, alias, customer_name, subtotal_eur, created_at)
+       values ($1,$2,$3,$4,$5, now())
+       on conflict (order_id) do nothing`,
+      [String(order.id), ordName, alias, customer, subtotal]
+    );
+    await pool.query(
+      `insert into aff_commissions(order_id, alias, amount_eur, status, created_at)
+       values ($1,$2,$3,'en_attente', now())
+       on conflict (order_id) do nothing`,
+      [String(order.id), alias, comEur]
+    );
+
+    // Tag commande (optionnel)
+    try{
+      const url=`https://${SHOP_DOMAIN}/admin/api/2024-10/orders/${order.id}.json`;
+      await fetch(url,{method:'PUT', headers:{'X-Shopify-Access-Token':SHOP_ADMIN_TOKEN,'Content-Type':'application/json'},
+        body:JSON.stringify({order:{id:order.id, tags:`${(order.tags||'')}, aff:${alias}, commission:${comEur}€ en_attente`}})});
+    }catch{}
+
+    res.status(200).send('ok');
+  }catch(e){ console.error(e); res.status(500).send('error'); }
+});
+
+/* --- JSON parser pour le reste --- */
+app.use(express.json());
+
+/** ====== APP PROXY (Shopify → Proxy URL = https://TON-DOM.vercel.app/api/index/proxy) ====== */
+app.get('/api/index/proxy/alias-check', async(req,res)=>{
+  try{
+    if(!hmacValidAppProxy(req.query)) return res.status(401).json({error:'bad signature'});
+    const alias=String(req.query.alias||'').trim().toUpperCase();
+    if(!alias) return res.json({available:false});
+    const r=await pool.query('select 1 from affiliates where alias=$1 limit 1',[alias]);
+    res.json({available:r.rowCount===0});
+  }catch{ res.status(500).json({error:'server_error'}); }
+});
+
+app.post('/api/index/proxy/apply', async(req,res)=>{
+  try{
+    if(!hmacValidAppProxy(req.query)) return res.status(401).json({error:'bad signature'});
+    const cid=req.query.logged_in_customer_id; if(!cid) return res.status(401).json({error:'login_required'});
+    const {alias, payout, wallet}=req.body||{};
+    const A=String(alias||'').trim().toUpperCase();
+    if(!/^[A-Z0-9\-_]{3,20}$/.test(A)) return res.status(400).json({error:'bad_alias'});
+    if(payout==='LGC' && (!wallet || String(wallet).length<20)) return res.status(400).json({error:'wallet_required'});
+    const ex=await pool.query('select 1 from affiliates where alias=$1 limit 1',[A]);
+    if(ex.rowCount>0) return res.status(400).json({error:'alias_taken'});
+
+    await pool.query(
+      `insert into affiliates(customer_id, alias, payout_type, wallet, status)
+       values ($1,$2,$3,$4,'pending')
+       on conflict (customer_id) do update set alias=excluded.alias, payout_type=excluded.payout_type, wallet=excluded.wallet, status='pending'`,
+      [String(cid), A, (payout==='LGC'?'LGC':'EUR'), wallet||null]
+    );
+    await tagCustomer(cid,'AFF_PENDING'); // optionnel
+    res.json({ok:true,status:'pending'});
+  }catch{ res.status(500).json({error:'server_error'}); }
+});
+
+app.get('/api/index/proxy/stats', async(req,res)=>{
+  try{
+    if(!hmacValidAppProxy(req.query)) return res.status(401).json({error:'bad signature'});
+    const cid=req.query.logged_in_customer_id; if(!cid) return res.status(401).json({error:'login_required'});
+
+    const me=await pool.query('select alias, status from affiliates where customer_id=$1',[String(cid)]);
+    const my=me.rows[0]; const admin=isAdminCustomer(cid);
+    if(!admin){ if(!my || my.status!=='active') return res.status(403).json({error:'not_active'}); }
+
+    const days=Math.min(parseInt(req.query.days||'30',10),90);
+    const since=new Date(Date.now()-days*86400000);
+    let alias=String(req.query.alias||'').trim().toUpperCase(); if(!admin) alias=my.alias;
+
+    const clicks=await pool.query(
+      `select coalesce(sum(count),0)::int as total,
+              coalesce(sum(case when day>=current_date then count else 0 end),0)::int as today,
+              coalesce(sum(case when day>=current_date - interval '7 day' then count else 0 end),0)::int as last7
+         from aff_clicks where day>=$1 and alias=$2`, [since, alias]
+    );
+    const orders=await pool.query(
+      `select count(*)::int as total, coalesce(sum(subtotal_eur),0)::numeric as revenue_eur
+         from aff_orders where created_at>=$1 and alias=$2`, [since, alias]
+    );
+    const comm=await pool.query(
+      `select coalesce(sum(amount_eur),0)::numeric as total_eur,
+              coalesce(sum(case when status='validee' then amount_eur else 0 end),0)::numeric as validated_eur
+         from aff_commissions where created_at>=$1 and alias=$2`, [since, alias]
+    );
+    const recent=await pool.query(
+      `select to_char(o.created_at,'DD/MM') as date, o.order_name as name, o.customer_name as customer,
+              o.subtotal_eur, c.status as commission_status
+         from aff_orders o join aff_commissions c using(order_id)
+        where o.created_at>=$1 and o.alias=$2
+        order by o.created_at desc limit 10`, [since, alias]
+    );
+
+    const cTot=clicks.rows[0]?.total||0; const oTot=orders.rows[0]?.total||0; const conv=cTot?(oTot/cTot)*100:0;
+
+    res.json({
+      alias,
+      clicks:{ total:cTot, today:clicks.rows[0]?.today||0, last7:clicks.rows[0]?.last7||0 },
+      orders:{ total:oTot, conv:+conv.toFixed(1) },
+      revenue_eur:+Number(orders.rows[0]?.revenue_eur||0),
+      commissions_eur:+Number(comm.rows[0]?.total_eur||0),
+      commissions_validated_eur:+Number(comm.rows[0]?.validated_eur||0),
+      recent_orders: recent.rows.map(r=>({ date:r.date, name:r.name, customer:r.customer, subtotal_eur:+Number(r.subtotal_eur||0), commission_status:r.commission_status }))
+    });
+  }catch{ res.status(500).json({error:'server_error'}); }
+});
+
+/** ====== API interne (hors App Proxy) ====== */
+// Log 1 clic (appelé par ton redirect /r/ALIAS)
+app.post('/api/index/click', async(req,res)=>{
+  try{
+    const { alias } = req.body||{}; if(!alias) return res.status(400).json({error:'alias required'});
+    await pool.query(
+      `insert into aff_clicks(alias, day, count) values ($1,current_date,1)
+       on conflict (alias, day) do update set count = aff_clicks.count + 1`, [String(alias).toUpperCase()]
+    );
+    res.json({ok:true});
+  }catch{ res.status(500).json({error:'server_error'}); }
+});
+
+// Valider commissions après 14j
+app.post('/api/index/tasks/validate', async(_req,res)=>{
+  try{
+    await pool.query(
+      `update aff_commissions
+          set status='validee', validated_at=now()
+        where status='en_attente' and created_at < now() - interval '14 day'`
+    );
+  res.json({ok:true});
+  }catch{ res.status(500).json({error:'server_error'}); }
+});
+
+// Admin: approuver un affilié
+app.post('/api/index/approve', async(req,res)=>{
+  try{
+    if(!ADMIN_SECRET || req.headers['x-admin-secret']!==ADMIN_SECRET) return res.status(401).json({error:'forbidden'});
+    const { customer_id } = req.body||{}; if(!customer_id) return res.status(400).json({error:'customer_id required'});
+    await pool.query(`update affiliates set status='active' where customer_id=$1`,[String(customer_id)]);
+    await tagCustomer(customer_id,'AFF_ACTIVE');
+    res.json({ok:true, customer_id});
+  }catch{ res.status(500).json({error:'server_error'}); }
+});
+
+// Admin: marquer payé
+app.post('/api/index/pay', async(req,res)=>{
+  try{
+    if(!ADMIN_SECRET || req.headers['x-admin-secret']!==ADMIN_SECRET) return res.status(401).json({error:'forbidden'});
+    const { alias } = req.body||{}; if(!alias) return res.status(400).json({error:'alias required'});
+    await pool.query(
+      `update aff_commissions set status='payee', paid_at=now()
+        where alias=$1 and status='validee'`, [String(alias).toUpperCase()]
+    );
+    res.json({ok:true});
+  }catch{ res.status(500).json({error:'server_error'}); }
+});
+
+// Health
+app.get('/api/index/health', (_req,res)=>res.json({ok:true}));
+
+/** ====== EXPORT SERVERLESS ====== */
+export default serverless(app);
